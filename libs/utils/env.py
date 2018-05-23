@@ -109,9 +109,11 @@ class TestEnv(ShareState):
             Directory path containing kernels and DTB images for the
             target. LISA does *not* manage this TFTP server, it must be
             provided externally. Optional.
-
         **results_dir**
             location of results of the experiments.
+        **ftrace**
+            Ftrace configuration merged with test-specific configuration.
+            Currently, only additional events through "events" key is supported.
 
     :param test_conf: Configuration of software for target experiments. Takes
                       the same form as target_conf. Fields are:
@@ -265,9 +267,16 @@ class TestEnv(ShareState):
 
         # Initialize ftrace events
         # test configuration override target one
-        if 'ftrace' in self.test_conf:
-            self.conf['ftrace'] = self.test_conf['ftrace']
-        if self.conf.get('ftrace'):
+        test_ftrace = self.test_conf.get('ftrace', {})
+        target_ftrace = self.conf.get('ftrace', {})
+        ftrace = test_ftrace or target_ftrace
+        # Merge the events from target config and test config
+        ftrace['events'] = sorted(
+            set(test_ftrace.get('events', []))
+          | set(target_ftrace.get('events', []))
+        )
+        self.conf['ftrace'] = ftrace
+        if ftrace['events']:
             self.__tools.append('trace-cmd')
 
         # Initialize features
@@ -709,25 +718,17 @@ class TestEnv(ShareState):
         if not force and self.ftrace is not None:
             return self.ftrace
 
-        if conf is None and 'ftrace' not in self.conf:
-            return None
+        ftrace = conf or self.conf.get('ftrace')
+        if ftrace is None:
+            return
 
-        if conf is not None:
-            ftrace = conf
-        else:
-            ftrace = self.conf['ftrace']
+        events = ftrace.get('events', FTRACE_EVENTS_DEFAULT)
+        functions = ftrace.get('functions', None)
+        buffsize = ftrace.get('buffsize', FTRACE_BUFSIZE_DEFAULT)
 
-        events = FTRACE_EVENTS_DEFAULT
-        if 'events' in ftrace:
-            events = ftrace['events']
-
-        functions = None
-        if 'functions' in ftrace:
-            functions = ftrace['functions']
-
-        buffsize = FTRACE_BUFSIZE_DEFAULT
-        if 'buffsize' in ftrace:
-            buffsize = ftrace['buffsize']
+        # If no events are specified, do not create the FtraceCollector
+        if not events:
+            return
 
         self.ftrace = devlib.FtraceCollector(
             self.target,
