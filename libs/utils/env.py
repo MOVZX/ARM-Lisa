@@ -458,7 +458,10 @@ class TestEnv(ShareState):
         # Setup board default if not specified by configuration
         self.nrg_model = None
         platform = None
+
+        default_modules = ['sched']
         self.__modules = ['cpufreq', 'cpuidle']
+
         if 'board' not in self.conf:
             self.conf['board'] = 'UNKNOWN'
 
@@ -522,7 +525,7 @@ class TestEnv(ShareState):
         # Modules configuration
         ########################################################################
 
-        modules = set(self.__modules)
+        modules = set(self.__modules + default_modules)
 
         # Refine modules list based on target.conf
         modules.update(self.conf.get('modules', []))
@@ -716,7 +719,7 @@ class TestEnv(ShareState):
     def _init_ftrace(self, force=False, conf=None):
 
         if not force and self.ftrace is not None:
-            return self.ftrace
+            return
 
         ftrace = conf or self.conf.get('ftrace')
         if ftrace is None:
@@ -726,8 +729,9 @@ class TestEnv(ShareState):
         functions = ftrace.get('functions', None)
         buffsize = ftrace.get('buffsize', FTRACE_BUFSIZE_DEFAULT)
 
-        # If no events are specified, do not create the FtraceCollector
-        if not events:
+        # If no events or functions have been specified:
+        # do not create the FtraceCollector
+        if not (events or functions):
             return
 
         self.ftrace = devlib.FtraceCollector(
@@ -748,7 +752,7 @@ class TestEnv(ShareState):
             for function in functions:
                 self._log.info('   %s', function)
 
-        return self.ftrace
+        return
 
     def _init_energy(self, force):
 

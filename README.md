@@ -1,6 +1,16 @@
-*__NOTE__: This is still a work in progress project, suitable for:*
-*developers, contributors and testers.*
-*None of the provided tests have been extensively evaluated as of January 2017.*
+# A word about the future
+
+A revamped and streamlined version of LISA is available under the 'next' branch
+(https://github.com/ARM-software/lisa/tree/next). Active development is moving
+towards that branch, so while we'll accept small fixes to LISA/master until we feel
+confident it is time to flip the switch, any other kind of pull requests should be
+sent against LISA/next.
+
+In short, this what you should expect to see:
+* Complete redo of our test classes (LisaTest & Executor)
+* Various clean ups of LISA internals (e.g. TestEnv)
+* Migration to Python3
+* Documentation overhaul (as in, not just bare docstrings)
 
 # Introduction
 

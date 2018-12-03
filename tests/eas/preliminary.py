@@ -181,8 +181,10 @@ class TestWorkThroughput(BasicCheckTest):
 class TestEnergyModelPresent(BasicCheckTest):
     def test_energy_model_present(self):
         """Test that we can see the energy model in sysctl"""
-        if not self.target.file_exists(
-                '/proc/sys/kernel/sched_domain/cpu0/domain0/group0/energy/'):
+        em_path = '/proc/sys/kernel/sched_domain/cpu0/domain0/group0/energy/'
+        sem_path = '/sys/devices/system/cpu/energy_model'
+        if not (self.target.file_exists(em_path) or
+                self.target.file_exists(sem_path)):
             raise AssertionError(
                 'No energy model visible in procfs. Possible causes: \n'
                 '- Kernel built without (CONFIG_SCHED_DEBUG && CONFIG_SYSCTL)\n'
@@ -248,9 +250,14 @@ class TestSchedDomainFlags(BasicCheckTest):
         """
         Check that some domain exists with SD_SHARE_CAP_STATES set
 
-        EAS silently does nothing if this flag is not set at any level (see
-        use of sd_scs percpu variable in scheduler code).
+        On old kernels (4.14 and before), EAS silently does nothing if this
+        flag is not set at any level (see use of sd_scs percpu variable in
+        scheduler code).
         """
+        if self.target.kernel_version.parts > (4, 14):
+            raise SkipTest('Target kernel version greater than v4.14, '
+                           'SD_SHARE_CAP_STATES not required')
+
         cpu0_flags = []
         for flags in self.iter_cpu_sd_flags(0):
             if flags & self.SD_SHARE_CAP_STATES:
@@ -323,3 +330,14 @@ class TestSchedDomainFlags(BasicCheckTest):
         finally:
             self.write_cpu_caps(old_caps)
             self._test_asym_cpucapacity(old_caps, old_caps_asym)
+
+    def test_sched_feat(self):
+        """
+        Check that ENERGY_AWARE is set if it is present.
+        """
+        path = '/sys/kernel/debug/sched_features'
+        sf = self.target.read_value(path)
+        if 'ENERGY_AWARE' not in sf:
+            raise SkipTest('ENERGY_AWARE sched feature not present')
+        if 'NO_ENERGY_AWARE' in sf:
+            raise AssertionError('ENERGY_AWARE sched feature is not set')

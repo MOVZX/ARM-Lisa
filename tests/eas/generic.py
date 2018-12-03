@@ -16,6 +16,7 @@
 #
 
 import os
+import logging
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -75,6 +76,8 @@ class _EnergyModelTest(LisaTest):
     def setUpClass(cls, *args, **kwargs):
         super(_EnergyModelTest, cls).runExperiments(*args, **kwargs)
 
+        cls._log = logging.getLogger('_EnergyModelTest')
+
     @classmethod
     def _getExperimentsConf(cls, test_env):
         if not test_env.nrg_model:
@@ -89,7 +92,6 @@ class _EnergyModelTest(LisaTest):
         conf = {
             'tag' : 'energy_aware',
             'flags' : ['ftrace', 'freeze_userspace'],
-            'sched_features' : 'ENERGY_AWARE',
         }
 
         if 'cpufreq' in test_env.target.modules:
@@ -344,9 +346,14 @@ class _EnergyModelTest(LisaTest):
             slack = pa.df(task)["Slack"]
 
             bad_activations_pct = len(slack[slack < 0]) * 100. / len(slack)
+
+            msg = 'task {} missed {}% of activations ({}% allowed)'.format(
+                    task, bad_activations_pct, self.negative_slack_allowed_pct)
+
             if bad_activations_pct > self.negative_slack_allowed_pct:
-                raise AssertionError("task {} missed {}% of activations".format(
-                    task, bad_activations_pct))
+                raise AssertionError(msg)
+            else:
+                self._log.info(msg)
 
     def _test_task_placement(self, experiment, tasks):
         """
@@ -498,6 +505,13 @@ class RampUp(_EnergyModelTest):
     """
     Test EAS for a task ramping from 5% up to 70%
     """
+    # The main purpose of this test is to ensure that as it grows in load, a
+    # task is migrated from LITTLE to big CPUs on a big.LITTLE system.
+    # This migration naturally happens some time _after_ it could possibly be
+    # done, since there must be some hysteresis to avoid a performance cost.
+    # Therefore allow a larger energy usage threshold
+    energy_est_threshold_pct = 15
+
     workloads = {
         "ramp_up" : {
             "type": "rt-app",
@@ -535,7 +549,15 @@ class RampDown(_EnergyModelTest):
     # This migration naturally happens some time _after_ it could possibly be
     # done, since there must be some hysteresis to avoid a performance cost.
     # Therefore allow a larger energy usage threshold
-    energy_est_threshold_pct = 15
+    #
+    # The number below has been found by trial and error on the platforms
+    # generally used for testing EAS (at the time of writing: Juno r0, Juno r2,
+    # Hikey960 and TC2). It would be better to estimate the amount of energy
+    # 'wasted' in the hysteresis (the overutilized band) and compute a threshold
+    # based on that. But implementing this isn't easy because it's very platform
+    # dependent, so until we have a way to do that easily in test classes, let's
+    # stick with the arbitrary threshold.
+    energy_est_threshold_pct = 18
 
     workloads = {
         "ramp_down" : {

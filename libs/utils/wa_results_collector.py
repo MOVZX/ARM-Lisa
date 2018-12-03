@@ -23,6 +23,7 @@ import pandas as pd
 import subprocess
 import logging
 import warnings
+import sqlite3
 
 from scipy.stats import ttest_ind
 import matplotlib.cm as cm
@@ -110,10 +111,19 @@ class WaResultsCollector(object):
                      this can take some time, so the extracted metrics are
                      cached in the provided output directories. Set this param
                      to False to disable this caching.
+
+    :param display_charts: This class uses IPython.display module to render some
+                           charts of workloads' results. But we also want to use
+                           this class without rendering any charts when we are
+                           only interested in table of figures. Set this param
+                           to False if you only want table of results but not
+                           display them.
     """
+    RE_WLTEST_DIR = re.compile(r"wa\.(?P<sha1>\w+)_(?P<name>.+)")
+
     def __init__(self, base_dir=None, wa_dirs=".*", platform=None,
                  kernel_repo_path=None, parse_traces=True,
-                 use_cached_trace_metrics=True):
+                 use_cached_trace_metrics=True, display_charts=True):
 
         self._log = logging.getLogger('WaResultsCollector')
 
@@ -140,6 +150,7 @@ class WaResultsCollector(object):
         if not self.parse_traces:
             self._log.warning("Trace parsing disabled")
         self.use_cached_trace_metrics = use_cached_trace_metrics
+        self.display_charts = display_charts
 
         df = pd.DataFrame()
         df_list = []
@@ -149,11 +160,12 @@ class WaResultsCollector(object):
         df = df.append(df_list)
 
         kernel_refs = {}
-        if kernel_repo_path:
-            for sha1 in df['kernel_sha1'].unique():
-                ref = Git.find_shortest_symref(kernel_repo_path, sha1)
-                if ref:
-                    kernel_refs[sha1] = ref
+        for sha1 in df['kernel_sha1'].unique():
+            if kernel_repo_path:
+                kernel_refs[sha1] = Git.find_shortest_symref(kernel_repo_path, sha1) or sha1
+            else:
+                kernel_refs[sha1] = sha1
+
 
         common_prefix = os.path.commonprefix(kernel_refs.values())
         for sha1, ref in kernel_refs.iteritems():
@@ -210,6 +222,37 @@ class WaResultsCollector(object):
 
         # results.csv contains all the metrics reported by WA for all jobs.
         df = pd.read_csv(os.path.join(wa_dir, 'results.csv'))
+        # When using Monsoon, the device is a single channel which reports
+        # two metrics. This means that devlib's DerivedEnergymeasurements class
+        # cannot see the output. Due to the way that the monsoon.py script
+        # works, it looks difficult to change Monsoon over to the Acme way of
+        # operating. As a workaround, let's mangle the results here instead.
+        unique_metrics = df['metric'].unique()
+        if 'device_total_energy' not in unique_metrics:
+            # potentially, we need to assemble a device_total_energy from
+            # other energy values we can add together.
+            if 'output_total_energy' in unique_metrics and 'USB_total_energy' in unique_metrics:
+                new_rows = []
+                output_df = df[df['metric'] == 'output_total_energy']
+                usb_df = df[df['metric'] == 'USB_total_energy']
+                # for each 'output_total_energy' metric, we will find
+                # the matching 'USB_total_energy' metric and assemble
+                # a 'device_total_energy' metric by adding them.
+                for row in output_df.iterrows():
+                    vals = row[1]
+                    _id = vals['id']
+                    _workload = vals['workload']
+                    _iteration = vals['iteration']
+                    _value = vals['value']
+                    usb_row = usb_df[(usb_df['workload'] == _workload) & (usb_df['id'] == _id) & (usb_df['iteration'] == _iteration)]
+                    new_val = float(_value) + float(usb_row['value'])
+                    # instead of creating a new row, just change the name
+                    # and value of this one
+                    vals['metric'] = 'device_total_energy'
+                    vals['value'] = new_val
+                    new_rows.append(vals)
+                # add all the new rows in one go at the end
+                df = df.append(new_rows, ignore_index=True)
 
         # __meta/jobs.json describes the jobs that were run - we can use this to
         # find extra artifacts (like traces and detailed energy measurement
@@ -254,6 +297,10 @@ class WaResultsCollector(object):
                 # If not, some workloads have a 'test' workload_parameter, try
                 # using that
                 test = job['workload_parameters']['test']
+            elif 'test_ids' in job['workload_parameters']:
+                # If not, some workloads have a 'test_ids' workload_parameter, try
+                # using that
+                test = job['workload_parameters']['test_ids']
             else:
                 # Otherwise just use the workload name.
                 # This isn't ideal because it means the results from jobs with
@@ -288,7 +335,12 @@ class WaResultsCollector(object):
             # Jobs can fail due to target misconfiguration or other problems,
             # without preventing us from collecting the results for the jobs
             # that ran OK.
-            with open(os.path.join(job_dir, 'result.json')) as f:
+            my_file = os.path.join(job_dir, 'result.json')
+            if not os.path.isfile(my_file):
+                skipped_jobs[iteration].append(job_id)
+                continue
+
+            with open(my_file) as f:
                 job_result = json.load(f)
                 if job_result['status'] == 'FAILED':
                     skipped_jobs[iteration].append(job_id)
@@ -346,7 +398,7 @@ class WaResultsCollector(object):
         metrics = []
         events = ['irq_handler_entry', 'cpu_frequency', 'nohz_kick', 'sched_switch',
                   'sched_load_cfs_rq', 'sched_load_avg_task', 'thermal_temperature']
-        trace = Trace(self.platform, trace_path, events)
+        trace = Trace(trace_path, events, self.platform)
 
         metrics.append(('cpu_wakeup_count', len(trace.data_frame.cpu_wakeups()), None))
 
@@ -447,6 +499,14 @@ class WaResultsCollector(object):
             df.loc[:, 'units'] = 'ms'
 
             extra_metric_list.append(df)
+        elif 'jankbench-results' in artifacts:
+            con = sqlite3.connect(artifacts['jankbench-results'])
+            df = pd.read_sql_query("SELECT _id, name, run_id, iteration, total_duration, jank_frame from ui_results", con)
+            df = pd.DataFrame({'value': df['total_duration']})
+            df.loc[:, 'metric'] = 'frame_total_duration'
+            df.loc[:, 'units'] = 'ms'
+
+            extra_metric_list.append(df)
 
         # WA's metrics model just exports overall energy metrics, not individual
         # samples. We're going to extend that with individual samples so if you
@@ -462,7 +522,12 @@ class WaResultsCollector(object):
                 continue
 
             if artifact_name.startswith('energy_instrument_output'):
-                df = pd.read_csv(path)
+
+                try:
+                    df = pd.read_csv(path)
+                except pandas.errors.ParserError as e:
+                    self._log.info(" no data for %s",  path)
+                    continue
 
                 if 'device_power' in df.columns:
                     # Looks like this is from an ACME
@@ -504,7 +569,21 @@ class WaResultsCollector(object):
         """
         with open(os.path.join(wa_dir, '__meta', 'target_info.json')) as f:
             target_info = json.load(f)
-        return KernelVersion(target_info['kernel_release']).sha1
+
+        # Read the kernel release reported by the target
+        sha1 = KernelVersion(target_info['kernel_release']).sha1
+        if sha1:
+            return sha1
+
+        # Couldn't get the release sha1, default to reading it from the
+        # directory name built by test_series
+        res_dir = os.path.basename(wa_dir)
+        match = re.search(WaResultsCollector.RE_WLTEST_DIR, res_dir)
+        if match:
+            return match.group("sha1")
+
+        raise RuntimeError("Couldn't find the sha1 of the kernel of the device "
+                           "that produced {}".format(wa_dir))
 
     @memoized
     def _select(self, tag='.*', kernel='.*', test='.*'):
@@ -635,6 +714,9 @@ class WaResultsCollector(object):
                           (lowest-valued boxplot at the top of the graph) of the
                           specified `sort_on` statistic.
         """
+        if not self.display_charts:
+            return
+
         sp = self._get_sort_params(sort_on)
         df = self._get_metric_df(workload, metric, tag, kernel, test)
         if df is None:
@@ -775,7 +857,8 @@ class WaResultsCollector(object):
                             by, sort_on, ascending, xlim)
         stats_df = self.describe(workload, metric, tag, kernel, test,
                                  by, sort_on, ascending)
-        display(stats_df)
+        if self.display_charts:
+            display(stats_df)
 
         return (axes, stats_df)
 
@@ -827,6 +910,10 @@ class WaResultsCollector(object):
 
         :param by: List of identifiers to group output as in DataFrame.groupby.
         """
+
+        if not self.display_charts:
+            return
+
         df = self._get_metric_df(workload, metric, tag, kernel, test)
         if df is None:
             return
@@ -951,7 +1038,7 @@ class WaResultsCollector(object):
                         # Find a p-value which hopefully represents the
                         # (complement of the) certainty that any difference in
                         # the mean represents something real.
-                        pvalue =  ttest_ind(group_results, base_results, equal_var=False).pvalue
+                        _, pvalue = ttest_ind(group_results, base_results, equal_var=False)
 
                     comparisons.append(Comparison(
                         metric, test, inv_id,
@@ -970,6 +1057,9 @@ class WaResultsCollector(object):
         'kernel' column in the results_df uses). If by='tag' then `base_id`
         should be a WA 'tag id' (as named in the WA agenda).
         """
+        if not self.display_charts:
+            return
+
         df = self.find_comparisons(base_id=base_id, by=by)
 
         if df.empty:

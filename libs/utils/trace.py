@@ -26,6 +26,7 @@ import json
 import warnings
 import operator
 import logging
+import webbrowser
 
 from analysis_register import AnalysisRegister
 from collections import namedtuple
@@ -41,15 +42,15 @@ class Trace(object):
     """
     The Trace object is the LISA trace events parser.
 
-    :param platform: a dictionary containing information about the target
-        platform
-    :type platform: dict or None
-
     :param data_dir: folder containing all trace data
     :type data_dir: str
 
-    :param events: events to be parsed (everything in the trace by default)
-    :type events: list(str)
+    :param events: events to be parsed (all the events by default)
+    :type events: str or list(str)
+
+    :param platform: a dictionary containing information about the target
+        platform
+    :type platform: dict
 
     :param window: time window to consider when parsing the trace
     :type window: tuple(int, int)
@@ -69,12 +70,28 @@ class Trace(object):
     :type plots_prefix: str
     """
 
-    def __init__(self, platform, data_dir, events,
+    def __init__(self, data_dir,
+                 events=None,
+                 platform=None,
                  window=(0, None),
                  normalize_time=True,
                  trace_format='FTrace',
                  plots_dir=None,
                  plots_prefix=''):
+
+        # Setup logging
+        self._log = logging.getLogger('Trace')
+
+        # Sanity check for API update:
+        # platform used to be the first mandatory argument, now is the third
+        # one and optional. We can still detect clients using the old API since
+        # the new first parameter is forced to be a string. If it's not,
+        # lekely the used is using the old API.
+        if not isinstance(data_dir, str):
+            logging.error("The first parameter of Trace() constructor is "
+                          "expected to be a sting path")
+            raise ValueError("Deprecated Trace() API usage detected: "
+                             "check constructor signature!")
 
         # The platform used to run the experiments
         self.platform = platform or {}
@@ -113,8 +130,8 @@ class Trace(object):
         # Folder containing all trace data
         self.data_dir = None
 
-        # Setup logging
-        self._log = logging.getLogger('Trace')
+        # Version of the traced kernel
+        self.kernel_version = None
 
         # Folder containing trace
         if not os.path.isdir(data_dir):
@@ -140,6 +157,20 @@ class Trace(object):
             max_cpu = max(int(self.data_frame.trace_event(e)['__cpu'].max())
                           for e in self.available_events)
             self.platform['cpus_count'] = max_cpu + 1
+        # If a CPUs count is not available here, let's assume we are running on
+        # a unicore system and set cpus_count=1 so that the following analysis
+        # methods will not complain about the CPUs count not being available.
+        self.platform['cpus_count'] = self.platform.get('cpus_count', 1)
+
+        # Setup kernel version
+        if self.platform.get('kernel', {}).get('parts'):
+            self.kernel_version = self.platform['kernel']['parts']
+            self._log.info('Kernel version loaded from platform data')
+        else:
+            self.kernel_version = (3, 18)
+            self._log.warning('Kernel version not available from platform data')
+        self._log.info('Parsing trace assuming kernel v%d.%d',
+                       self.kernel_version[0], self.kernel_version[1])
 
         self.analysis = AnalysisRegister(self)
 
@@ -183,6 +214,10 @@ class Trace(object):
         :param events: single event name or list of events names
         :type events: str or list(str)
         """
+        # Parse all events by default
+        if events is None:
+            self.events = []
+            return
         if isinstance(events, basestring):
             self.events = events.split(' ')
         elif isinstance(events, list):
@@ -230,7 +265,9 @@ class Trace(object):
         else:
             window_kw['abs_window'] = window
 
-        self.ftrace = trace_class(path, scope="custom", events=self.events,
+        # Make sure event names are not unicode strings
+        events = [e.encode('ascii') for e in self.events]
+        self.ftrace = trace_class(path, scope="custom", events=events,
                                   normalize_time=self.normalize_time, **window_kw)
 
         # Load Functions profiling data
@@ -393,6 +430,23 @@ class Trace(object):
                  name
         """
         return self._tasks_by_pid.TaskName.to_dict()
+
+    def show(self):
+        """
+        Open the parsed trace using the most appropriate native viewer.
+
+        The native viewer depends on the specified trace format:
+        - ftrace: open using kernelshark
+        - systrace: open using a browser
+
+        In both cases the native viewer is assumed to be available in the host
+        machine.
+        """
+        if isinstance(self.ftrace, trappy.FTrace):
+            return os.popen("kernelshark '{}'".format(self.ftrace.trace_path))
+        if isinstance(self.ftrace, trappy.SysTrace):
+            return webbrowser.open(self.ftrace.trace_path)
+        self._log.warning('No trace data available')
 
 
 ###############################################################################
@@ -595,17 +649,11 @@ class Trace(object):
         """ Add a column with overutilized status duration. """
         if not self.hasEvents('sched_overutilized'):
             return
-        df = self._dfg_trace_event('sched_overutilized')
-        df['start'] = df.index
-        df['len'] = (df.start - df.start.shift()).fillna(0).shift(-1)
-        df.drop('start', axis=1, inplace=True)
 
-        # Fix the last event, which will have a NaN duration
-        # Set duration to trace_end - last_event
-        df.loc[df.index[-1], 'len'] = self.start_time + self.time_range - df.index[-1]
+        df = self._dfg_trace_event('sched_overutilized')
+        self.addEventsDeltas(df, 'len')
 
         # Build a stat on trace overutilization
-        df = self._dfg_trace_event('sched_overutilized')
         self.overutilized_time = df[df.overutilized == 1].len.sum()
         self.overutilized_prc = 100. * self.overutilized_time / self.time_range
 
@@ -829,7 +877,6 @@ class Trace(object):
         # Fix sequences of wakeup/sleep events reported with the same index
         return handle_duplicate_index(cpu_active)
 
-
     @memoized
     def getClusterActiveSignal(self, cluster):
         """
@@ -907,6 +954,127 @@ class Trace(object):
         freq['effective_rate'] = np.where(freq['state'] == 0, 0,
                                           np.where(freq['state'] == 1, freq['rate'], float('nan')))
         return freq
+
+    def addEventsDeltas(self, df, col_name='delta'):
+        """
+        Compute the time between each event in a dataframe, and store it in a
+        new column. This only really makes sense for events tracking an
+        on/off state (e.g. overutilized, idle)
+        """
+        if df.empty:
+            return df
+
+        if col_name in df.columns:
+            raise RuntimeError("Column {} is already present in the dataframe".
+                               format(col_name))
+
+        df['start'] = df.index
+        df[col_name] = (df.start - df.start.shift()).fillna(0).shift(-1)
+        df.drop('start', axis=1, inplace=True)
+
+        # Fix the last event, which will have a NaN duration
+        # Set duration to trace_end - last_event
+        df.loc[df.index[-1], col_name] = self.start_time + self.time_range - df.index[-1]
+
+    @staticmethod
+    def squash_df(df, start, end, column='delta'):
+        """
+        Slice a dataframe of deltas in [start:end] and ensure we have
+        an event at exactly those boundaries.
+
+        The input dataframe is expected to have a "column" which reports
+        the time delta between consecutive rows, as for example dataframes
+        generated by addEventsDeltas().
+
+        The returned dataframe is granted to have an initial and final
+        event at the specified "start" ("end") index values, which values
+        are the same of the last event before (first event after) the
+        specified "start" ("end") time.
+
+        Examples:
+
+        Slice a dataframe to [start:end], and work on the time data so that it
+        makes sense within the interval.
+
+        Examples to make it clearer:
+
+        df is:
+        Time len state
+        15    1   1
+        16    1   0
+        17    1   1
+        18    1   0
+        -------------
+
+        slice_df(df, 16.5, 17.5) =>
+
+        Time len state
+        16.5  .5   0
+        17    .5   1
+
+        slice_df(df, 16.2, 16.8) =>
+
+        Time len state
+        16.2  .6   0
+
+        :returns: a new df that fits the above description
+        """
+        if df.empty:
+            return df
+
+        end = min(end, df.index[-1] + df[column].values[-1])
+        res_df = pd.DataFrame(data=[], columns=df.columns)
+
+        if start > end:
+            return res_df
+
+        # There's a few things to keep in mind here, and it gets confusing
+        # even for the people who wrote the code. Let's write it down.
+        #
+        # It's assumed that the data is continuous, i.e. for any row 'r' within
+        # the trace interval, we will find a new row at (r.index + r.len)
+        # For us this means we'll never end up with an empty dataframe
+        # (if we started with a non empty one)
+        #
+        # What's we're manipulating looks like this:
+        # (| = events; [ & ] = start,end slice)
+        #
+        # |   [   |   ]   |
+        # e0  s0  e1  s1  e2
+        #
+        # We need to push e0 within the interval, and then tweak its duration
+        # (len column). The mathemagical incantation for that is:
+        # e0.len = min(e1.index - s0, s1 - s0)
+        #
+        # This takes care of the case where s1 isn't in the interval
+        # If s1 is in the interval, we just need to cap its len to
+        # s1 - e1.index
+
+        prev_df = df[:start]
+        middle_df = df[start:end]
+
+        # Tweak the closest previous event to include it in the slice
+        if not prev_df.empty and not (start in middle_df.index):
+            res_df = res_df.append(prev_df.tail(1))
+            res_df.index = [start]
+            e1 = end
+
+            if not middle_df.empty:
+                e1 = middle_df.index[0]
+
+            res_df[column] = min(e1 - start, end - start)
+
+        if not middle_df.empty:
+            res_df = res_df.append(middle_df)
+            if end in res_df.index:
+                # e_last and s1 collide, ditch e_last
+                res_df = res_df.drop([end])
+            else:
+                # Fix the delta for the last row
+                delta = min(end - res_df.index[-1], res_df[column].values[-1])
+                res_df.at[res_df.index[-1], column] = delta
+
+        return res_df
 
 class TraceData:
     """ A DataFrame collector exposed to Trace's clients """
